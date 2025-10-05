@@ -11,35 +11,28 @@ class BluetoothService {
   // Request device and connect
   async connect() {
     try {
-      // Define the services we're interested in
-      const serviceUuids = [
-        'heart_rate',           // Heart Rate Service
-        'device_information',   // Device Information Service
-        0x180D,                 // Heart Rate Service UUID
-        0x180F,                 // Battery Service UUID
-        0x1810,                 // Blood Pressure Service UUID
-        0x1813,                 // Glucose Service UUID
-      ];
+      console.log('Requesting any Bluetooth device...');
 
-      // Request Bluetooth device
+      // Check if Web Bluetooth API is supported
+      if (!navigator.bluetooth) {
+        throw new Error('Web Bluetooth API is not supported in this browser. Please use a Chromium-based browser (Chrome, Edge, Opera).');
+      }
+
+      // Request any Bluetooth LE device for prototype purposes
       this.device = await navigator.bluetooth.requestDevice({
-        filters: [
-          { services: serviceUuids },
-          { namePrefix: 'Fitbit' },
-          { namePrefix: 'Garmin' },
-          { namePrefix: 'Apple' },
-          { namePrefix: 'Samsung' }
-        ],
-        optionalServices: serviceUuids
+        acceptAllDevices: true,
+        optionalServices: []  // Empty to explore all services dynamically
       });
+
+      console.log(`Connected to device: ${this.device.name || this.device.id}`);
 
       this.device.addEventListener('gattserverdisconnected', this.onDisconnected.bind(this));
 
       // Connect to GATT server
       this.server = await this.device.gatt.connect();
 
-      // Get primary services
-      await this.discoverServices();
+      // Get all primary services and explore them dynamically
+      await this.discoverAllServices();
 
       this.isConnected = true;
       this.notifyListeners('connected', { device: this.device });
@@ -48,7 +41,20 @@ class BluetoothService {
 
     } catch (error) {
       console.error('Bluetooth connection failed:', error);
-      return { success: false, error: error.message };
+
+      // Provide user-friendly error messages
+      let userMessage = error.message;
+      if (error.code === 8 || error.message.includes('NotFoundError')) {
+        userMessage = 'No Bluetooth devices found. Please ensure your device is nearby, powered on, and in pairing mode.';
+      } else if (error.code === 2 || error.message.includes('NotAllowedError')) {
+        userMessage = 'Permission denied. Please allow access to Bluetooth devices when prompted.';
+      } else if (error.message.includes('NotSupportedError')) {
+        userMessage = 'Bluetooth is not supported on this device or browser.';
+      } else if (error.message.includes('NetworkError')) {
+        userMessage = 'Connection failed. Please ensure your device is not already connected to another device.';
+      }
+
+      return { success: false, error: userMessage };
     }
   }
 
@@ -65,26 +71,84 @@ class BluetoothService {
     this.notifyListeners('disconnected');
   }
 
-  // Discover available services and characteristics
-  async discoverServices() {
+  // Discover all available services and characteristics dynamically
+  async discoverAllServices() {
     try {
+      console.log('Discovering all available services...');
+
+      if (!this.server) {
+        throw new Error('No GATT server available. Please reconnect the device.');
+      }
+
       const services = await this.server.getPrimaryServices();
 
+      if (services.length === 0) {
+        console.warn('No services found on this device.');
+        return;
+      }
+
       for (const service of services) {
+        console.log(`Service: ${service.uuid}`);
         this.services.set(service.uuid, service);
 
-        const characteristics = await service.getCharacteristics();
-        for (const characteristic of characteristics) {
-          this.characteristics.set(characteristic.uuid, characteristic);
-
-          // Start notifications for relevant characteristics
-          if (this.shouldStartNotifications(characteristic)) {
-            await this.startNotifications(characteristic);
-          }
-        }
+        // Get all characteristics for this service
+        await this.discoverCharacteristicsForService(service);
       }
     } catch (error) {
       console.error('Service discovery failed:', error);
+      throw new Error(`Failed to discover services: ${error.message}`);
+    }
+  }
+
+  // Discover characteristics for a specific service
+  async discoverCharacteristicsForService(service) {
+    try {
+      const characteristics = await service.getCharacteristics();
+      console.log(`  Found ${characteristics.length} characteristics`);
+
+      for (const characteristic of characteristics) {
+        console.log(`  Characteristic: ${characteristic.uuid}`);
+        this.characteristics.set(characteristic.uuid, characteristic);
+
+        // Try to read the characteristic value if readable
+        await this.tryReadCharacteristic(characteristic);
+
+        // Try to subscribe to notifications if available
+        await this.tryStartNotifications(characteristic);
+      }
+    } catch (error) {
+      console.warn(`  Cannot discover characteristics for service ${service.uuid}:`, error);
+    }
+  }
+
+  // Try to read a characteristic value
+  async tryReadCharacteristic(characteristic) {
+    try {
+      if (characteristic.properties.read) {
+        const value = await characteristic.readValue();
+        console.log(`  Read value:`, new Uint8Array(value.buffer));
+
+        // Parse the data based on characteristic UUID or store raw data
+        const parsedData = this.parseCharacteristicData(characteristic.uuid, value);
+        if (parsedData) {
+          this.notifyListeners('data', parsedData);
+        }
+      }
+    } catch (error) {
+      console.warn(`  Cannot read characteristic ${characteristic.uuid}:`, error);
+    }
+  }
+
+  // Try to start notifications for a characteristic
+  async tryStartNotifications(characteristic) {
+    try {
+      if (characteristic.properties.notify) {
+        await characteristic.startNotifications();
+        characteristic.addEventListener('characteristicvaluechanged', this.onCharacteristicValueChanged.bind(this));
+        console.log(`  Started notifications for ${characteristic.uuid}`);
+      }
+    } catch (error) {
+      console.warn(`  Cannot start notifications for ${characteristic.uuid}:`, error);
     }
   }
 
@@ -115,6 +179,10 @@ class BluetoothService {
   onCharacteristicValueChanged(event) {
     const characteristic = event.target;
     const value = event.target.value;
+
+    console.log(`Notification from ${characteristic.uuid}:`, new Uint8Array(value.buffer));
+
+    // Parse the data based on characteristic UUID or store raw data
     const data = this.parseCharacteristicData(characteristic.uuid, value);
 
     if (data) {
@@ -127,6 +195,7 @@ class BluetoothService {
     const buffer = value.buffer;
     const dataView = new DataView(buffer);
 
+    // Handle known characteristic UUIDs
     switch (uuid) {
       case 0x2A37: // Heart Rate Measurement
         return this.parseHeartRateMeasurement(dataView);
@@ -137,8 +206,24 @@ class BluetoothService {
       case 0x2A9C: // Body Sensor Location
         return { type: 'body_sensor_location', location: dataView.getUint8(0) };
 
+      case 0x2A19: // Battery Level
+        return { type: 'battery_level', level: dataView.getUint8(0) };
+
+      case 0x2A25: // Serial Number String
+      case 0x2A29: // Manufacturer Name String
+      case 0x2A24: // Model Number String
+        // String characteristics
+        const decoder = new TextDecoder('utf-8');
+        return { type: 'device_info', uuid, value: decoder.decode(value) };
+
       default:
-        return { type: 'unknown', uuid, value: Array.from(new Uint8Array(buffer)) };
+        // Unknown characteristic - store raw data
+        return {
+          type: 'unknown',
+          uuid,
+          value: Array.from(new Uint8Array(buffer)),
+          timestamp: new Date()
+        };
     }
   }
 
@@ -226,9 +311,17 @@ class BluetoothService {
 
       const info = {};
       for (const char of characteristics) {
-        const value = await char.readValue();
-        const decoder = new TextDecoder('utf-8');
-        info[char.uuid] = decoder.decode(value);
+        if (char.properties.read) {
+          const value = await char.readValue();
+          const decoder = new TextDecoder('utf-8');
+          info[char.uuid] = decoder.decode(value);
+        }
+      }
+
+      // Also try to get battery level if available
+      const batteryLevel = await this.getBatteryLevel();
+      if (batteryLevel !== null) {
+        info.batteryLevel = batteryLevel;
       }
 
       return info;
@@ -245,9 +338,12 @@ class BluetoothService {
       if (!batteryService) return null;
 
       const batteryLevelChar = await batteryService.getCharacteristic(0x2A19); // Battery Level
-      const value = await batteryLevelChar.readValue();
+      if (batteryLevelChar && batteryLevelChar.properties.read) {
+        const value = await batteryLevelChar.readValue();
+        return value.getUint8(0);
+      }
 
-      return value.getUint8(0);
+      return null;
     } catch (error) {
       console.error('Failed to get battery level:', error);
       return null;
